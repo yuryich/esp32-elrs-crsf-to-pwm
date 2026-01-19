@@ -1,85 +1,204 @@
 #include <Arduino.h>
+#include <map>
 #include "crsf.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 #define RXD2 16
 #define TXD2 17
+#define VTX_RX_PIN 18
+#define VTX_TX_PIN 23
+
 #define SBUS_BUFFER_SIZE 25
-uint8_t _rcs_buf[25] {};
+
+uint8_t _rcs_buf[SBUS_BUFFER_SIZE] {};
 uint16_t _raw_rc_values[RC_INPUT_MAX_CHANNELS] {};
 uint16_t _raw_rc_count{};
 
-int aileronsPin = 12;
-int elevatorPin = 13;
-int throttlePin = 14;
-int rudderPin = 15;
+HardwareSerial trampSerial(1);
 
-int aileronsPWMChannel = 1;
-int elevatorPWMChannel = 2;
-int throttlePWMChannel = 3;
-int rudderPWMChannel = 4;
+uint32_t lastVTXUpdate = 0;
+const uint32_t VTX_UPDATE_INTERVAL = 500;  // Обновлять каждые 500 мс
+
+// ---------------- Таблица "частота -> код" ----------------
+struct FreqCode {
+  uint16_t freq;
+  uint8_t code;
+};
+
+// Пример: можно расширить под весь freq_table
+std::map<std::uint16_t, std::uint8_t> freqTable = {
+    // A
+    {5865, 0},
+    {5845, 1},
+    {5825, 2},
+    {5805, 3},
+    {5785, 4},
+    {5765, 5},
+    {5745, 6},
+    {5725, 7},
+
+    // B
+    {5733, 8},
+    {5752, 9},
+    {5771, 10},
+    {5790, 11},
+    {5809, 12},
+    {5828, 13},
+    {5847, 14},
+    {5866, 15},
+
+    // E
+    {5705, 16},
+    {5685, 17},
+    {5665, 18},
+    {5645, 19},
+    {5885, 20},
+    {5905, 21},
+    {5925, 22},
+    {5945, 23},
+
+    // F
+    {5740, 24},
+    {5760, 25},
+    {5780, 26},
+    {5800, 27},
+    {5820, 28},
+    {5840, 29},
+    {5860, 30},
+    {5880, 31},
+
+    // R
+    {5658, 32},
+    {5695, 33},
+    {5732, 34},
+    {5769, 35},
+    {5806, 36},
+    {5843, 37},
+    // {5880, 0x38},
+    {5917, 39},
+
+    // L
+    {5362, 40},
+    {5399, 41},
+    {5436, 42},
+    {5473, 43},
+    {5510, 44},
+    {5547, 45},
+    {5584, 46},
+    {5621, 47},
+
+    // X
+    {4990, 48},
+    {5020, 49},
+    {5050, 50},
+    {5080, 51},
+    {5110, 52},
+    {5140, 53},
+    {5170, 54},
+    {5200, 55}
+};
+
+const uint8_t FREQ_TABLE_SIZE = sizeof(freqTable) / sizeof(freqTable[0]);
 
 
-void SetServoPos(float percent, int pwmChannel)
-{
-    // 50 cycles per second 1,000ms / 50 = 100 /5 = 20ms per cycle
-    // 1ms / 20ms = 1/20 duty cycle
-    // 2ms / 20ms = 2/20 = 1/10 duty cycle
-    // using 16 bit resolution for PWM signal convert to range of 0-65536 (0-100% duty/on time)
-    // 1/20th of 65536 = 3276.8
-    // 1/10th of 65536 = 6553.6
+uint16_t findFreqCode(uint16_t freq) {
+  uint16_t num, currentDiff;
+  uint16_t closest = freqTable.begin()->first;
+  uint16_t minDiff = abs(closest - freq);
 
-    uint32_t duty = map(percent, 0, 100, 3276.8, 6553.6);
+  for (auto it = freqTable.begin(); it != freqTable.end(); ++it)
+  {
+      num = it->first;
+      currentDiff = abs(num - freq);
+      if (currentDiff < minDiff) {
+          minDiff = currentDiff;
+          closest = num;
+      }
+  }
 
-    ledcWrite(pwmChannel, duty);
+  return closest;
 }
+
+// ---------------- Отправка команды Steadyview X ----------------
+
+void setModuleFrequencyX(uint16_t frequency) {
+  uint16_t closest = findFreqCode(frequency);
+  uint8_t freq_value = freqTable[closest];
+  uint8_t data[] = {0x02, 0x06, 0x31, freq_value, 0x01, 0x03};
+  
+  uint8_t crc = 0;
+  for (int i = 1; i < 4; i++) {
+      crc ^= data[i];
+  }
+  data[4] = crc;
+    
+  for (int i = 0; i < 5; i++) {
+      trampSerial.write(data, sizeof(data));
+      delay(1);
+  }
+  
+  
+
+  Serial.print("Set freq: ");
+  Serial.print(frequency);
+  Serial.print(" MHz, code: ");
+  Serial.println(freq_value);
+}
+
+
+
+uint16_t currentFreq = 0;
+
+void updateVTXFromAux8(int aux8Value) {
+  uint16_t freq;
+
+  if (aux8Value < 1000) {
+    freq = 5865;   
+  } else if (aux8Value < 1100) {
+    freq = 5845;
+  } else if (aux8Value < 1210) {
+    freq = 5825;
+  } else if (aux8Value < 1350) {
+    freq = 5805;
+  } else if (aux8Value < 1450) {
+    freq = 5785;
+  } else if (aux8Value < 1560) {
+    freq = 5765;
+  } else if (aux8Value < 1875) {
+    freq = 5745;
+  } else {
+    freq = 5725;   
+  }
+
+  if (freq != currentFreq) {
+    currentFreq = freq;
+    setModuleFrequencyX(freq);
+  }
+}
+
 
 void setup() {
-  // Note the format for setting a serial port is as follows: Serial2.begin(baud-rate, protocol, RX pin, TX pin);
-  Serial.begin(460800);
-  //Serial1.begin(9600, SERIAL_8N1, RXD2, TXD2);
-  Serial2.begin(420000, SERIAL_8N1, RXD2, TXD2);
-  Serial.println("Serial Txd is on pin: "+String(TX));
-  Serial.println("Serial Rxd is on pin: "+String(RX));
-  
-  ledcSetup(aileronsPWMChannel,50,16);
-  ledcSetup(elevatorPWMChannel,50,16);
-  ledcSetup(throttlePWMChannel,50,16);
-  ledcSetup(rudderPWMChannel,50,16);
+  Serial.begin(115200);
 
-  ledcAttachPin(aileronsPin, aileronsPWMChannel);
-  ledcAttachPin(elevatorPin, elevatorPWMChannel);
-  ledcAttachPin(throttlePin, throttlePWMChannel);
-  ledcAttachPin(rudderPin, rudderPWMChannel);
+  Serial2.begin(420000, SERIAL_8N1, RXD2, TXD2);
+
+  trampSerial.begin(115200, SERIAL_8N1, VTX_RX_PIN, VTX_TX_PIN);
 }
 
-void loop() { //Choose Serial1 or Serial2 as required
-  // Serial.println("looping");
+void loop() {
   while (Serial2.available()) {
     size_t numBytesRead = Serial2.readBytes(_rcs_buf, SBUS_BUFFER_SIZE);
-    if(numBytesRead > 0)
-    {
-      crsf_parse(&_rcs_buf[0], SBUS_BUFFER_SIZE, &_raw_rc_values[0], &_raw_rc_count, RC_INPUT_MAX_CHANNELS );
-      Serial.print("Channel 1: ");
-      Serial.print(_raw_rc_values[0]);
-      Serial.print("\tChannel 2: ");
-      Serial.print(_raw_rc_values[1]);
-      Serial.print("\tChannel 3: ");
-      Serial.print(_raw_rc_values[2]);
-      Serial.print("\tChannel 4: ");
-      Serial.print(_raw_rc_values[3]);
-      Serial.print("\tChannel 5: ");
-      Serial.println(_raw_rc_values[4]);
-
-      int aileronsMapped = map(_raw_rc_values[0], 1000, 2000, 0, 100);
-      int elevatorMapped = map(_raw_rc_values[1], 1000, 2000, 0, 100);
-      int throttleMapped = map(_raw_rc_values[2], 1000, 2000, 0, 100);
-      int rudderMapped = map(_raw_rc_values[3], 1000, 2000, 0, 100);
-      int switchMapped = map(_raw_rc_values[4], 1000, 2000, 0, 100);
-
-      SetServoPos(aileronsMapped, aileronsPWMChannel);
-      SetServoPos(elevatorMapped, elevatorPWMChannel);
-      SetServoPos(throttleMapped, throttlePWMChannel);
-      SetServoPos(rudderMapped, rudderPWMChannel);
+    if (numBytesRead > 0) {
+      crsf_parse(&_rcs_buf[0], SBUS_BUFFER_SIZE,
+                 &_raw_rc_values[0], &_raw_rc_count, RC_INPUT_MAX_CHANNELS);
+      int AUX8 = _raw_rc_values[11];  // 12‑й канал (AUX8)
+      Serial.print("Channel 12 (AUX8): ");
+      Serial.println(AUX8);
+      if (millis() - lastVTXUpdate > VTX_UPDATE_INTERVAL) {
+        updateVTXFromAux8(AUX8);
+        lastVTXUpdate = millis();
+      }
     }
   }
 }
